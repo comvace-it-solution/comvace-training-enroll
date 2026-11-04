@@ -48,9 +48,12 @@ PAT ではなく App を使います。権限を絞れて、退職時の失効�
 
 **Organization permissions**
 
-| 権限    | レベル         | 用途                                           |
-| ------- | -------------- | ---------------------------------------------- |
-| Members | Read and write | org への招待、講師チームへのリポジトリ割り当て |
+現在の `courses.json`（`instructorTeam` なし・`inviteToOrg` なし）では **不要** です。
+最小権限に保つため、付与しないでください。
+
+| 権限    | レベル         | 必要になる条件                                             |
+| ------- | -------------- | ---------------------------------------------------------- |
+| Members | Read and write | `instructorTeam` または `inviteToOrg` を有効にしたときのみ |
 
 **Where can this GitHub App be installed?** → `Only on this account`
 
