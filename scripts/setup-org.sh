@@ -61,8 +61,15 @@ fi
 
 info "3. コース定義（courses.json）"
 
-while IFS=$'\t' read -r course template team invite; do
+# コース名だけを読み、各値は個別に引く。
+# TSV + IFS=$'\t' ではタブが空白文字として連続分を潰すため、
+# 省略されたキー（instructorTeam など）があるとフィールドがずれる。
+while IFS= read -r course; do
   printf '  [%s]\n' "$course"
+
+  template="$(jq -r --arg c "$course" '.[$c].template' courses.json)"
+  team="$(jq -r --arg c "$course" '.[$c].instructorTeam // ""' courses.json)"
+  invite="$(jq -r --arg c "$course" '(.[$c].inviteToOrg // false) | tostring' courses.json)"
 
   if ! gh api "repos/$ORG/$template" --silent 2>/dev/null; then
     warn "  テンプレート $ORG/$template が見つかりません"
@@ -71,7 +78,8 @@ while IFS=$'\t' read -r course template team invite; do
   fi
 
   if [ "$(gh api "repos/$ORG/$template" --jq .is_template)" = "true" ]; then
-    ok "  テンプレート $template（Template repository 有効）"
+    # 全角文字が直後に続くので ${} で変数名の終わりを明示する
+    ok "  テンプレート ${template}（Template repository 有効）"
   else
     warn "  $template の Template repository フラグが無効です"
     warn "    gh api -X PATCH repos/$ORG/$template -F is_template=true"
@@ -92,9 +100,7 @@ while IFS=$'\t' read -r course template team invite; do
     warn "  inviteToOrg = true です。招待リンクを知った第三者が org メンバーに"
     warn "  なれてしまうため、意図した設定か確認してください。"
   fi
-done < <(jq -r 'to_entries[]
-  | [.key, .value.template, (.value.instructorTeam // ""), ((.value.inviteToOrg // false) | tostring)]
-  | @tsv' courses.json)
+done < <(jq -r 'keys[]' courses.json)
 
 info "4. 受付のスイッチと上限"
 
