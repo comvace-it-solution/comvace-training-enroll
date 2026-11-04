@@ -1,0 +1,2 @@
+# フォーム以外からの Issue 作成を禁止する（自由記述の Issue が来ても払い出せないため）
+blank_issues_enabled: false

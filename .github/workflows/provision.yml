@@ -1,0 +1,269 @@
+name: provision
+
+on:
+  issues:
+    types: [opened]
+
+# GITHUB_TOKEN は Issue の操作にだけ使う。
+# リポジトリ作成・権限付与は GitHub App のインストールトークンで行う。
+permissions:
+  contents: read
+  issues: write
+
+# 流量チェックが同時実行で擦り抜けないよう、払い出しは常に 1 件ずつ処理する
+concurrency:
+  group: provision
+  cancel-in-progress: false
+
+jobs:
+  provision:
+    # 払い出しフォーム由来の Issue だけを処理する
+    if: contains(github.event.issue.labels.*.name, 'enroll')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Issue 本文は受講者の自由入力なので run: に直接展開せず env 経由で受け取る
+      # （直接展開するとシェルインジェクションになる）
+      - name: 受付状態と入力を検証
+        id: validate
+        env:
+          ISSUE_BODY: ${{ github.event.issue.body }}
+          STUDENT: ${{ github.event.issue.user.login }}
+          ENROLL_OPEN: ${{ vars.ENROLL_OPEN || 'true' }}
+        run: |
+          set -euo pipefail
+
+          # 受付期間のスイッチ。研修の開始時期だけ開けておく運用を想定している。
+          if [ "$ENROLL_OPEN" != "true" ]; then
+            printf '現在、研修リポジトリの払い出しを受け付けていません。\n研修担当者に連絡してください。\n' > reject.txt
+            exit 1
+          fi
+
+          printf '%s' "$ISSUE_BODY" > issue-body.md
+
+          # Issue Form は「### 見出し」の直後に回答値を出力する
+          field() {
+            awk -v h="### $1" '
+              $0 == h { found = 1; next }
+              found && /^### / { exit }
+              found && NF { print; exit }
+            ' issue-body.md
+          }
+
+          COURSE="$(field 'コース')"
+          # リポジトリの description（上限 350 バイト）に使うため長さを抑える。
+          # 途中で切れたマルチバイト文字は iconv -c で落として不正な UTF-8 を残さない。
+          DISPLAY_NAME="$(field 'お名前' | tr -d '\000-\037' | head -c 200 | iconv -c -f UTF-8 -t UTF-8)"
+
+          if [ -z "$COURSE" ] || ! jq -e --arg c "$COURSE" 'has($c)' courses.json >/dev/null; then
+            printf 'コース「%s」は courses.json に登録されていません。\nフォームから選び直すか、研修担当者に連絡してください。\n' \
+              "${COURSE:-未入力}" > reject.txt
+            exit 1
+          fi
+
+          PREFIX="$(jq -r --arg c "$COURSE" '.[$c].repoPrefix' courses.json)"
+          # GitHub アカウント名は英数とハイフンのみだが、念のため想定外の文字を落とす
+          SLUG="$(printf '%s' "$STUDENT" | sed 's/[^A-Za-z0-9._-]/-/g')"
+
+          {
+            echo "course=$COURSE"
+            echo "display_name=$DISPLAY_NAME"
+            echo "template=$(jq -r --arg c "$COURSE" '.[$c].template' courses.json)"
+            echo "instructor_team=$(jq -r --arg c "$COURSE" '.[$c].instructorTeam // ""' courses.json)"
+            echo "invite_to_org=$(jq -r --arg c "$COURSE" '.[$c].inviteToOrg // false' courses.json)"
+            echo "repo_prefix=$PREFIX"
+            echo "repo=${PREFIX}-${SLUG}"
+          } >> "$GITHUB_OUTPUT"
+
+      # 作成対象のリポジトリはまだ存在しないため、owner 単位でトークンを発行する
+      - name: GitHub App トークンを発行
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.PROVISIONER_APP_ID }}
+          private-key: ${{ secrets.PROVISIONER_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      # 招待リンクは「知っている人なら誰でも使える」ので、万一リンクが外部に漏れても
+      # 大量に払い出されないよう直近 24 時間の作成数で上限をかける。
+      - name: 直近の払い出し数を確認
+        id: ratelimit
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ORG: ${{ github.repository_owner }}
+          PREFIX: ${{ steps.validate.outputs.repo_prefix }}
+          MAX_PER_DAY: ${{ vars.ENROLL_MAX_PER_DAY || '10' }}
+          REPO: ${{ steps.validate.outputs.repo }}
+        run: |
+          set -euo pipefail
+
+          # 既に払い出し済みの受講者は再実行なので上限の対象外にする
+          if gh api "repos/$ORG/$REPO" --silent 2>/dev/null; then
+            echo "既存リポジトリの再実行なので流量チェックをスキップします"
+            exit 0
+          fi
+
+          SINCE="$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)"
+          RECENT="$(gh api "orgs/$ORG/repos?sort=created&direction=desc&per_page=100" \
+            | jq --arg since "$SINCE" --arg prefix "$PREFIX" \
+                '[.[] | select((.name | startswith($prefix)) and (.created_at > $since))] | length')"
+
+          echo "直近 24 時間の払い出し: ${RECENT} 件 / 上限 ${MAX_PER_DAY} 件"
+
+          if [ "$RECENT" -ge "$MAX_PER_DAY" ]; then
+            printf '直近 24 時間の払い出し上限（%s 件）に達したため、自動払い出しを停止しました。\n研修担当者に連絡してください。\n' \
+              "$MAX_PER_DAY" > reject.txt
+            # 担当者が確認すべき事象なので Issue を open のまま残す
+            touch alert
+            exit 1
+          fi
+
+      - name: プライベートリポジトリを払い出す
+        id: provision
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          ORG: ${{ github.repository_owner }}
+          STUDENT: ${{ github.event.issue.user.login }}
+          TEMPLATE: ${{ steps.validate.outputs.template }}
+          REPO: ${{ steps.validate.outputs.repo }}
+          TEAM: ${{ steps.validate.outputs.instructor_team }}
+          INVITE_TO_ORG: ${{ steps.validate.outputs.invite_to_org }}
+          DISPLAY_NAME: ${{ steps.validate.outputs.display_name }}
+        run: |
+          set -euo pipefail
+
+          # 二重申請でも壊れないよう、既存リポジトリがあれば作成をスキップする
+          if gh api "repos/$ORG/$REPO" --silent 2>/dev/null; then
+            echo "既存のリポジトリを再利用します: $ORG/$REPO"
+            echo "created=false" >> "$GITHUB_OUTPUT"
+          else
+            gh api -X POST "repos/$ORG/$TEMPLATE/generate" \
+              -f owner="$ORG" \
+              -f name="$REPO" \
+              -f description="$DISPLAY_NAME さんの研修用リポジトリ" \
+              -F private=true \
+              -F include_all_branches=false \
+              --silent
+            echo "created=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          # 作成直後は API から見えるまで少し遅延することがある
+          for _ in 1 2 3 4 5; do
+            gh api "repos/$ORG/$REPO" --silent 2>/dev/null && break
+            sleep 3
+          done
+
+          # 受講者本人に Write を付与。org 未参加なら外部コラボレーターとして
+          # 招待が発行される（現在の受講者と同じ扱い。org の席は消費しない）。
+          gh api -X PUT "repos/$ORG/$REPO/collaborators/$STUDENT" \
+            -f permission=push --silent
+
+          # courses.json で明示的に有効化したときだけ org に招待する。
+          # 既定で無効なのは、リンクを知った第三者が org メンバーになれてしまうため。
+          if [ "$INVITE_TO_ORG" = "true" ]; then
+            gh api -X PUT "orgs/$ORG/memberships/$STUDENT" \
+              -f role=member --silent \
+              || echo "::warning::org への招待に失敗しました（既にメンバーの可能性があります）"
+          fi
+
+          # 講師チームに Admin を付与。ここが失敗しても払い出し自体は成功扱いにする。
+          if [ -n "$TEAM" ]; then
+            gh api -X PUT "orgs/$ORG/teams/$TEAM/repos/$ORG/$REPO" \
+              -f permission=admin --silent \
+              || echo "::warning::チーム '$TEAM' への権限付与に失敗しました。手動で確認してください。"
+          fi
+
+          echo "url=https://github.com/$ORG/$REPO" >> "$GITHUB_OUTPUT"
+
+      - name: 結果を Issue に通知してクローズ
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          STUDENT: ${{ github.event.issue.user.login }}
+          DISPLAY_NAME: ${{ steps.validate.outputs.display_name }}
+          COURSE: ${{ steps.validate.outputs.course }}
+          REPO_URL: ${{ steps.provision.outputs.url }}
+          CREATED: ${{ steps.provision.outputs.created }}
+        run: |
+          set -euo pipefail
+
+          if [ "$CREATED" = "true" ]; then
+            HEADLINE="リポジトリを作成しました 🎉"
+          else
+            HEADLINE="すでに払い出し済みのリポジトリがあります"
+          fi
+
+          cat > comment.md <<EOF
+          @${STUDENT} さん、${HEADLINE}
+
+          **$REPO_URL**
+
+          ### 次にやること
+
+          1. GitHub の通知（またはメール）に届いた招待を **承認** してください。承認するまでリポジトリは開けません。
+          2. 承認後、手元にクローンしてください。
+
+             \`\`\`
+             git clone ${REPO_URL}.git
+             \`\`\`
+
+          3. 課題ごとにブランチを切って作業し、Pull Request で提出してください。
+
+          リポジトリを開けない場合や招待が届かない場合は、この Issue ではなく研修担当者に直接連絡してください。
+          EOF
+
+          gh issue comment "$ISSUE_NUMBER" --body-file comment.md
+          gh issue edit "$ISSUE_NUMBER" --add-label provisioned || true
+          gh issue close "$ISSUE_NUMBER" --reason completed
+          gh issue lock "$ISSUE_NUMBER" --reason resolved || true
+
+          # 担当者が Actions の一覧から誰に何を払い出したか追えるようにする
+          {
+            echo "### 払い出し結果"
+            echo
+            echo "| 項目 | 値 |"
+            echo "| --- | --- |"
+            echo "| アカウント | \`$STUDENT\` |"
+            echo "| 氏名 | $DISPLAY_NAME |"
+            echo "| コース | $COURSE |"
+            echo "| リポジトリ | $REPO_URL |"
+            echo "| 新規作成 | $CREATED |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 失敗を Issue に通知
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          STUDENT: ${{ github.event.issue.user.login }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          if [ -f reject.txt ]; then
+            {
+              echo "@${STUDENT} さん、リポジトリを払い出せませんでした。"
+              echo
+              cat reject.txt
+            } > comment.md
+            gh issue comment "$ISSUE_NUMBER" --body-file comment.md
+
+            if [ -f alert ]; then
+              # 流量上限など、担当者の判断が必要な却下は open のまま残す
+              gh issue edit "$ISSUE_NUMBER" --add-label provision-failed || true
+            else
+              # 入力の問題。受講者が直せるのでクローズする
+              gh issue close "$ISSUE_NUMBER" --reason "not planned"
+            fi
+          else
+            # 想定外のエラー。担当者が調べる必要があるので open のままにする
+            {
+              echo "@${STUDENT} さん、払い出し処理でエラーが発生しました。"
+              echo "研修担当者が確認しますので、そのままお待ちください。"
+              echo
+              echo "実行ログ: $RUN_URL"
+            } > comment.md
+            gh issue comment "$ISSUE_NUMBER" --body-file comment.md
+            gh issue edit "$ISSUE_NUMBER" --add-label provision-failed || true
+          fi

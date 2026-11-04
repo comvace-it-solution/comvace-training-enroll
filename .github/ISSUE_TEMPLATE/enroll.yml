@@ -1,0 +1,42 @@
+name: 研修リポジトリの払い出し
+description: 受講用のプライベートリポジトリを自動作成します
+title: "[enroll] 研修リポジトリ払い出し希望"
+labels: ["enroll"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        このフォームを送信すると、`comvace-it-solution` 内にあなた専用の
+        **プライベートリポジトリ** が自動作成されます。
+
+        - リポジトリを見られるのは **あなたと研修担当者のみ** です
+        - 作成されたリポジトリの URL は、このフォーム送信後に自動でコメントされます
+        - 処理は 1 分ほどかかります
+
+  - type: dropdown
+    id: course
+    attributes:
+      label: コース
+      description: 受講するコースを選択してください
+      options:
+        - frontend-basic
+    validations:
+      required: true
+
+  - type: input
+    id: display_name
+    attributes:
+      label: お名前
+      description: 研修担当者が受講者を識別するために使います（リポジトリ名には使われません）
+      placeholder: 山田 太郎
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: ack
+    attributes:
+      label: 確認事項
+      options:
+        # 払い出し先はログイン中のアカウントに固定されるため、ここで取り違えを防ぐ
+        - label: 研修で使う GitHub アカウントでログインしていることを確認しました
+          required: true

@@ -1,0 +1,6 @@
+{
+  "frontend-basic": {
+    "template": "comvace-inc-frontend-basic-training",
+    "repoPrefix": "comvace-frontend-training"
+  }
+}
