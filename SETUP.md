@@ -30,13 +30,21 @@ public にするのは、まだ org に参加していない受講者でもフ�
 Classroom の代わりに org へリポジトリを作る主体です。
 PAT ではなく App を使います。権限を絞れて、退職時の失効管理も不要になるためです。
 
-<https://github.com/organizations/comvace-it-solution/settings/apps/new> を開き、以下を設定します。
+GitHub App を作成する API は存在しないため、ブラウザでの操作が 1 回必要です。
+ただし **App Manifest フロー**を使えば、権限が設定済みの登録画面を開けるので、
+フォームを手入力する必要はありません（権限の付け間違いも起きません）。
 
-| 項目             | 値                             |
-| ---------------- | ------------------------------ |
-| GitHub App name  | `comvace-training-provisioner` |
-| Homepage URL     | 受付リポジトリの URL           |
-| Webhook → Active | **チェックを外す**             |
+```sh
+python3 scripts/register-app.py \
+  comvace-it-solution comvace-it-solution/comvace-training-enroll
+```
+
+ブラウザが開くので **「Create GitHub App for comvace-it-solution」** を押すだけです。
+App ID と秘密鍵が `/tmp/gh-app-setup/` に保存されます。
+
+> App 名は GitHub 全体で一意です。既に使われている場合は登録画面の名前欄で変更してください。
+
+このスクリプトが設定する権限は以下です（手で作る場合の参照用）。
 
 **Repository permissions**
 
@@ -57,14 +65,27 @@ PAT ではなく App を使います。権限を絞れて、退職時の失効�
 
 **Where can this GitHub App be installed?** → `Only on this account`
 
-作成後の画面で以下を行います。
+### App を org にインストールする
 
-1. **App ID** をメモする
-2. 「Private keys」→ **Generate a private key** で `.pem` をダウンロード
-3. 左メニュー「Install App」→ org にインストール → **All repositories** を選択
+作成しただけでは使えません。インストールもブラウザ操作が必要です（API なし）。
 
-   新しく作るリポジトリにもトークンが効く必要があるため、
-   ここは `Only select repositories` ではなく `All repositories` にします。
+```sh
+open https://github.com/apps/comvace-training-provisioner/installations/new
+```
+
+`comvace-it-solution` を選び、**All repositories** を選んで Install します。
+
+> ここは必ず `All repositories` にしてください。払い出すリポジトリは**まだ存在しない**ため、
+> `Only select repositories` では新規リポジトリにトークンが効きません。
+
+インストールされたか確認します。
+
+```sh
+gh api orgs/comvace-it-solution/installations \
+  --jq '.installations[] | {app_slug, repository_selection, permissions}'
+```
+
+`repository_selection` が `all` になっていれば正しい状態です。
 
 ## 3. 認証情報を受付リポジトリに登録する
 

@@ -2,9 +2,5 @@
   "frontend-basic": {
     "template": "comvace-inc-frontend-basic-training",
     "repoPrefix": "comvace-frontend-training"
-  },
-  "smoke-test": {
-    "template": "comvace-inc-frontend-basic-training",
-    "repoPrefix": "zz-smoke-test"
   }
 }
