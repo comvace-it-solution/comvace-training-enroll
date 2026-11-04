@@ -133,45 +133,116 @@ jobs:
         run: |
           set -euo pipefail
 
-          # 二重申請でも壊れないよう、既存リポジトリがあれば作成をスキップする
+          # GitHub 側の一時的な 5xx / 429 のときだけ再試行する。
+          # 4xx は再試行しても無駄なので即座に失敗させる。
+          retry_api() {
+            local attempt err
+            err="$(mktemp)"
+            for attempt in 1 2 3; do
+              if gh api "$@" 2>"$err"; then rm -f "$err"; return 0; fi
+              if ! grep -qE 'HTTP (5[0-9][0-9]|429)|Server Error' "$err"; then
+                cat "$err" >&2; rm -f "$err"; return 1
+              fi
+              echo "::warning::一時エラーのため再試行します ($attempt/3)"
+              sleep $((attempt * 5))
+            done
+            cat "$err" >&2; rm -f "$err"; return 1
+          }
+
+          # ブランチが 0 件なら「コミットが 1 つも無い空のリポジトリ」。
+          # テンプレートの複製が完了したかの判定に使う。
+          branch_count() {
+            gh api "repos/$ORG/$REPO/branches" --jq 'length' 2>/dev/null || echo 0
+          }
+
+          # 過去の払い出しが途中で失敗して空のまま残った残骸を片付ける。
+          # 空リポジトリにはコミットが無いので失うものは無いが、
+          # 取り違えを防ぐためサイズとブランチ数を確認してから削除する。
+          delete_if_empty() {
+            local size branches
+            size="$(gh api "repos/$ORG/$REPO" --jq '.size' 2>/dev/null || echo -1)"
+            branches="$(branch_count)"
+            if [ "$size" = "0" ] && [ "$branches" = "0" ]; then
+              echo "::warning::空のリポジトリを削除します: $ORG/$REPO"
+              retry_api -X DELETE "repos/$ORG/$REPO" --silent
+              return 0
+            fi
+            return 1
+          }
+
+          need_create=true
+
           if gh api "repos/$ORG/$REPO" --silent 2>/dev/null; then
-            echo "既存のリポジトリを再利用します: $ORG/$REPO"
-            echo "created=false" >> "$GITHUB_OUTPUT"
-          else
-            gh api -X POST "repos/$ORG/$TEMPLATE/generate" \
-              -f owner="$ORG" \
-              -f name="$REPO" \
-              -f description="$DISPLAY_NAME さんの研修用リポジトリ" \
-              -F private=true \
-              -F include_all_branches=false \
-              --silent
-            echo "created=true" >> "$GITHUB_OUTPUT"
+            if [ "$(branch_count)" != "0" ]; then
+              # 二重申請。中身があるのでそのまま再利用する
+              echo "既存のリポジトリを再利用します: $ORG/$REPO"
+              need_create=false
+            else
+              # 中身が無い既存リポジトリは、以前の払い出しが
+              # 途中で失敗した残骸。再利用すると空のまま渡してしまう。
+              if ! delete_if_empty; then
+                echo "既存リポジトリの状態を判定できませんでした。手動で確認してください。" >&2
+                exit 1
+              fi
+            fi
           fi
 
-          # 作成直後は API から見えるまで少し遅延することがある
-          for _ in 1 2 3 4 5; do
-            gh api "repos/$ORG/$REPO" --silent 2>/dev/null && break
-            sleep 3
-          done
+          if [ "$need_create" = true ]; then
+            if ! retry_api -X POST "repos/$ORG/$TEMPLATE/generate" \
+                  -f owner="$ORG" \
+                  -f name="$REPO" \
+                  -f description="$DISPLAY_NAME さんの研修用リポジトリ" \
+                  -F private=true \
+                  -F include_all_branches=false \
+                  --silent; then
+              # 5xx でリポジトリだけ作られることがあるため、残骸を消してから失敗させる
+              gh api "repos/$ORG/$REPO" --silent 2>/dev/null && delete_if_empty || true
+              printf 'GitHub 側の一時的なエラーで作成できませんでした。\n少し時間をおいて、もう一度フォームを送信してください。\n' > reject.txt
+              touch alert
+              exit 1
+            fi
+
+            # テンプレートの複製は非同期。中身が入る前に権限を付けると 502 になる。
+            for _ in $(seq 1 20); do
+              [ "$(branch_count)" != "0" ] && break
+              sleep 3
+            done
+
+            if [ "$(branch_count)" = "0" ]; then
+              # 空のまま残すと次回の申請で「既存」と誤認されるので片付ける
+              delete_if_empty || true
+              printf 'テンプレートの複製が完了しませんでした。\n少し時間をおいて、もう一度フォームを送信してください。\n' > reject.txt
+              touch alert
+              exit 1
+            fi
+          fi
+
+          echo "created=$need_create" >> "$GITHUB_OUTPUT"
 
           # 受講者本人に Write を付与。org 未参加なら外部コラボレーターとして
           # 招待が発行される（現在の受講者と同じ扱い。org の席は消費しない）。
-          gh api -X PUT "repos/$ORG/$REPO/collaborators/$STUDENT" \
+          retry_api -X PUT "repos/$ORG/$REPO/collaborators/$STUDENT" \
             -f permission=push --silent
 
           # courses.json で明示的に有効化したときだけ org に招待する。
           # 既定で無効なのは、リンクを知った第三者が org メンバーになれてしまうため。
           if [ "$INVITE_TO_ORG" = "true" ]; then
-            gh api -X PUT "orgs/$ORG/memberships/$STUDENT" \
+            retry_api -X PUT "orgs/$ORG/memberships/$STUDENT" \
               -f role=member --silent \
               || echo "::warning::org への招待に失敗しました（既にメンバーの可能性があります）"
           fi
 
           # 講師チームに Admin を付与。ここが失敗しても払い出し自体は成功扱いにする。
           if [ -n "$TEAM" ]; then
-            gh api -X PUT "orgs/$ORG/teams/$TEAM/repos/$ORG/$REPO" \
+            retry_api -X PUT "orgs/$ORG/teams/$TEAM/repos/$ORG/$REPO" \
               -f permission=admin --silent \
               || echo "::warning::チーム '$TEAM' への権限付与に失敗しました。手動で確認してください。"
+          fi
+
+          # 最終確認。ここまで来て空なら受講者に渡せないので失敗させる。
+          if [ "$(branch_count)" = "0" ]; then
+            echo "払い出し後の検証に失敗しました（リポジトリが空です）" >&2
+            exit 1
           fi
 
           echo "url=https://github.com/$ORG/$REPO" >> "$GITHUB_OUTPUT"
