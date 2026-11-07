@@ -21,6 +21,45 @@ jobs:
     if: contains(github.event.issue.labels.*.name, 'enroll')
     runs-on: ubuntu-latest
     steps:
+      # 「待てばいいのか分からない」状態を避けるため、他の処理より先にコメントする。
+      # このコメントは最後に結果へ書き換えるので、受講者が見る吹き出しは常に 1 つ。
+      - name: 受付したことを即座に知らせる
+        id: ack
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          STUDENT: ${{ github.event.issue.user.login }}
+        run: |
+          set -uo pipefail
+
+          cat > /tmp/ack.md <<EOF
+          ### ⏳ 受け付けました — リポジトリを準備しています
+
+          @${STUDENT} さん、そのまま **1 分ほどお待ちください**。
+
+          | | |
+          | --- | --- |
+          | 状態 | 🔄 処理中 |
+          | 目安 | 1 分程度 |
+
+          完了すると、**このコメントが結果に書き換わります**。
+          変わらない場合はページを再読み込みしてください。
+          このページを閉じても処理は進みます（完了時に GitHub から通知が届きます）。
+          EOF
+
+          # コメント本文は jq で JSON に包む（改行や記号をそのまま安全に送るため）。
+          # パイプではなくファイル渡しにして、pipefail と SIGPIPE の絡みを避ける。
+          jq -n --rawfile body /tmp/ack.md '{body: $body}' > /tmp/ack.json
+          CID="$(gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
+            --input /tmp/ack.json --jq .id 2>/dev/null || true)"
+          echo "comment_id=${CID}" >> "$GITHUB_OUTPUT"
+
+          # ラベルでも一目で分かるようにする
+          gh issue edit "$ISSUE_NUMBER" --add-label processing || true
+
+          # ここが失敗しても払い出し自体は続ける（通知は本質ではない）
+          exit 0
+
       - uses: actions/checkout@v5
 
       # Issue 本文は受講者の自由入力なので run: に直接展開せず env 経由で受け取る
@@ -256,6 +295,7 @@ jobs:
           COURSE: ${{ steps.validate.outputs.course }}
           REPO_URL: ${{ steps.provision.outputs.url }}
           CREATED: ${{ steps.provision.outputs.created }}
+          COMMENT_ID: ${{ steps.ack.outputs.comment_id }}
         run: |
           set -euo pipefail
 
@@ -266,25 +306,31 @@ jobs:
           fi
 
           cat > comment.md <<EOF
-          @${STUDENT} さん、${HEADLINE}
+          ### ✅ 完了 — ${HEADLINE}
 
-          **$REPO_URL**
+          @${STUDENT} さん、あなた専用のリポジトリはこちらです。
+
+          ## $REPO_URL
 
           ### 次にやること
 
-          1. GitHub の通知（またはメール）に届いた招待を **承認** してください。承認するまでリポジトリは開けません。
-          2. 承認後、手元にクローンしてください。
+          1. GitHub から届く**招待を承認**してください。
+             承認するまでリポジトリは開けません。
+          2. 承認できたら、**引き続きオンクラスの指示に従って環境構築を進めてください。**
 
-             \`\`\`
-             git clone ${REPO_URL}.git
-             \`\`\`
-
-          3. 課題ごとにブランチを切って作業し、Pull Request で提出してください。
-
-          リポジトリを開けない場合や招待が届かない場合は、この Issue ではなく研修担当者に直接連絡してください。
+          リポジトリが開けない、または招待が届かない場合は、研修担当者に連絡してください。
           EOF
 
-          gh issue comment "$ISSUE_NUMBER" --body-file comment.md
+          # 「処理中」のコメントを結果に書き換える（吹き出しを増やさない）
+          if [ -n "${COMMENT_ID:-}" ]; then
+            jq -n --rawfile body comment.md '{body: $body}' > payload.json
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${COMMENT_ID}" \
+              --input payload.json --silent
+          else
+            gh issue comment "$ISSUE_NUMBER" --body-file comment.md
+          fi
+
+          gh issue edit "$ISSUE_NUMBER" --remove-label processing || true
           gh issue edit "$ISSUE_NUMBER" --add-label provisioned || true
           gh issue close "$ISSUE_NUMBER" --reason completed
           gh issue lock "$ISSUE_NUMBER" --reason resolved || true
@@ -309,32 +355,46 @@ jobs:
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           STUDENT: ${{ github.event.issue.user.login }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMMENT_ID: ${{ steps.ack.outputs.comment_id }}
         run: |
           set -euo pipefail
 
           if [ -f reject.txt ]; then
             {
-              echo "@${STUDENT} さん、リポジトリを払い出せませんでした。"
+              echo "### ⚠️ 払い出しできませんでした"
+              echo
+              echo "@${STUDENT} さん"
               echo
               cat reject.txt
             } > comment.md
-            gh issue comment "$ISSUE_NUMBER" --body-file comment.md
-
-            if [ -f alert ]; then
-              # 流量上限など、担当者の判断が必要な却下は open のまま残す
-              gh issue edit "$ISSUE_NUMBER" --add-label provision-failed || true
-            else
-              # 入力の問題。受講者が直せるのでクローズする
-              gh issue close "$ISSUE_NUMBER" --reason "not planned"
-            fi
           else
-            # 想定外のエラー。担当者が調べる必要があるので open のままにする
+            # 想定外のエラー。担当者が調べる必要がある。
             {
+              echo "### ⚠️ エラーが発生しました"
+              echo
               echo "@${STUDENT} さん、払い出し処理でエラーが発生しました。"
               echo "研修担当者が確認しますので、そのままお待ちください。"
+              echo "**この Issue を閉じないでください。**"
               echo
               echo "実行ログ: $RUN_URL"
             } > comment.md
+          fi
+
+          # 「処理中」のコメントを結果に書き換える
+          if [ -n "${COMMENT_ID:-}" ]; then
+            jq -n --rawfile body comment.md '{body: $body}' > payload.json
+            gh api -X PATCH "repos/${GITHUB_REPOSITORY}/issues/comments/${COMMENT_ID}" \
+              --input payload.json --silent
+          else
             gh issue comment "$ISSUE_NUMBER" --body-file comment.md
+          fi
+
+          gh issue edit "$ISSUE_NUMBER" --remove-label processing || true
+
+          if [ -f reject.txt ] && [ ! -f alert ]; then
+            # 入力の問題。受講者が直せるのでクローズする
+            gh issue close "$ISSUE_NUMBER" --reason "not planned"
+          else
+            # 担当者の判断が必要なものは open のまま残す
             gh issue edit "$ISSUE_NUMBER" --add-label provision-failed || true
           fi

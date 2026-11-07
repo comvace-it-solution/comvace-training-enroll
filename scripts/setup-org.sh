@@ -31,6 +31,7 @@ fi
 
 # フォームが付与するラベルと、ワークフローが結果に応じて付けるラベルを用意する
 for pair in "enroll:0E8A16:払い出しフォームからの申請" \
+            "processing:FBCA04:払い出し処理中" \
             "provisioned:1D76DB:払い出し済み" \
             "provision-failed:B60205:担当者の確認が必要な申請"; do
   name="${pair%%:*}"
