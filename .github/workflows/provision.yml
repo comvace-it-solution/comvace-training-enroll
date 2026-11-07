@@ -54,6 +54,11 @@ jobs:
             --input /tmp/ack.json --jq .id 2>/dev/null || true)"
           echo "comment_id=${CID}" >> "$GITHUB_OUTPUT"
 
+          # タイトル欄は Issue Forms では隠せないので、受講者には入力させず
+          # ここで誰の依頼か分かる形に統一する。
+          gh issue edit "$ISSUE_NUMBER" \
+            --title "研修用リポジトリ作成依頼：\"${STUDENT}\"" || true
+
           # ラベルでも一目で分かるようにする
           gh issue edit "$ISSUE_NUMBER" --add-label processing || true
 
